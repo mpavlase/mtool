@@ -9,6 +9,8 @@ import libvirt
 from xml.dom.minidom import parseString as _domParseStr
 import exceptions
 
+# only for exception handling
+import socket
 
 # TODO: update to some real url
 _METADATA_NS_URI = 'http://qos-manager.org/ns/1.0'
@@ -128,6 +130,13 @@ class QoSManager(object):
         url = self.config.get('mom', 'rpc-url')
         self.log.info('Connecting to MoM RPC via %s' % url)
         self.mom = xmlrpclib.ServerProxy(url)
+
+        # verify that connection to MoM is active
+        try:
+            self.mom.ping()
+        except socket.error, e:
+            raise Exception('Connection to MoM failed, probably is not '\
+                            'runing: %s' % e)
 
     def plan_list(self):
         plans = self._get_plans()
