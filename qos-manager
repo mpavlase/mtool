@@ -8,6 +8,7 @@ import xmlrpclib
 import libvirt
 from xml.dom.minidom import parseString as _domParseStr
 import exceptions
+import json
 
 # only for exception handling
 import socket
@@ -39,7 +40,7 @@ class QoSManager(object):
         self.log.addHandler(handler)
         self.log.setLevel('DEBUG')
 
-    def _get_plans(self):
+    def _load_all_plans(self):
         """
         Lazy loading all plans
         """
@@ -48,8 +49,8 @@ class QoSManager(object):
                 self.config.get('plans', 'dir'),
                 self.config.get('plans', 'config-file'))
 
-            self.plans = ConfigParser.SafeConfigParser()
-            self.plans.read(filename)
+            self.log.info('Loading plans definition from: ' + filename)
+            self.plans = json.load(open(filename))
         return self.plans
 
     def _load_default_config(self):
@@ -61,7 +62,7 @@ class QoSManager(object):
             },
             'plans': {
                 'dir': '/home/mpavlase/prace/mom-tool/plans', #TODO
-                'config-file': 'default.conf',
+                'config-file': 'default.json',
                 'default': 'default',
             },
             'mom': {
@@ -81,13 +82,10 @@ class QoSManager(object):
         self.libvirt = libvirt.open(url)
 
     def _get_plan(self, plan):
-        plans = self._get_plans()
-        if plan not in plans.sections():
+        plans = self._load_all_plans()
+        if plan not in plans.keys():
             raise NotFoundException('Plan "%s" is not yet defined.' % plan)
 
-        ret = {}
-        for key, val in plans.items(plan):
-            ret[key] = val
         return ret
 
     def domain_set_plan(self, domain, plan_name):
@@ -139,8 +137,8 @@ class QoSManager(object):
                             'runing: %s' % e)
 
     def plan_list(self):
-        plans = self._get_plans()
-        self.log.info('avaliable plans: %s' % plans.sections())
+        plans = self._load_all_plans()
+        self.log.info('avaliable plans: %s' % plans.keys())
 
 
 if __name__ == '__main__':
