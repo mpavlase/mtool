@@ -1,0 +1,259 @@
+#!/usr/bin/env python
+# Copyright (c) Martin Pavlasek, 2014 Red Hat, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import ConfigParser
+import logging
+import sys
+import errno
+import os
+import xmlrpclib
+import libvirt
+from xml.dom.minidom import parseString as _domParseStr
+import exceptions
+import json
+
+# only for exception handling
+import socket
+
+# TODO: update to some real url
+METADATA_NS_URI = 'http://github.com/mpavlase/mom-simulator/1'
+METADATA_ELEMENT = 'constants'
+
+class NotFoundException(exceptions.Exception):
+    pass
+
+
+class QoSManager(object):
+    def __init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self._setup_logging()
+        self.config = ConfigParser.SafeConfigParser()
+        self._load_default_config()
+        #self.config.write(open('mtool.conf', 'w+'))
+        self._connect_to_libvirt()
+        self.plans = None
+
+    def _setup_logging(self):
+        #formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        formatter = logging.Formatter("%(name)s.%(levelname)s: %(message)s")
+        handler = logging.StreamHandler()
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        self.logger.setLevel('ERROR')
+
+    def set_config(self, filename):
+        self.config.read(filename)
+
+    def _load_all_plans(self):
+        """
+        Lazy loading all plans
+        """
+        if not self.plans:
+            filename = os.path.join( \
+                self.config.get('plans', 'dir'),
+                self.config.get('plans', 'config-file'))
+
+            self.logger.info('Loading plans definition from: ' + filename)
+            self.plans = json.load(open(filename))
+        return self.plans
+
+    def _store_all_plans(self):
+        plans = self._load_all_plans()
+        filename = os.path.join( \
+            self.config.get('plans', 'dir'),
+            self.config.get('plans', 'config-file'))
+
+        self.logger.info('Store plans to: ' + filename)
+        json.dump(plans, open(filename, 'w+'))
+
+    def _load_default_config(self):
+        defaults = {
+            'libvirt': {
+                'url': '',
+                'metadata-uri': 'http://ovirt.org/vm/tune/1.0',
+                'metadata-element': 'qos',
+                'metadata-app': 'ovirt',
+            },
+            'plans': {
+                'dir': 'plans',
+                'config-file': 'default.json',
+                'default': 'default',
+            },
+        }
+
+        for section in defaults:
+            self.config.add_section(section)
+            for k, v in defaults[section].iteritems():
+                self.config.set(section, k, str(v))
+
+    def _connect_to_libvirt(self):
+        url = self.config.get('libvirt', 'url')
+        #self.logger.info('Connecting to libvirt %s' % url)
+        self.libvirt = libvirt.open(url)
+
+    def _get_plan(self, plan):
+        plans = self._load_all_plans()
+        if plan not in plans.keys():
+            raise NotFoundException('Plan "%s" is not yet defined.' % plan)
+
+        return plans[plan]
+
+    def domain_set_plan(self, domain, plan_name):
+        plan = self._get_plan(plan_name)
+
+        xml = '<plan>%s</plan>' % plan_name
+
+        for key in plan:
+            xml += '<{el}>{value}</{el}>'.format(el=key, value=plan[key])
+
+        xml = '<{0}>{1}</{0}>'.format('constants', xml)
+
+        domain.setMetadata(
+            libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+            xml, METADATA_ELEMENT,
+            METADATA_NS_URI, 0)
+
+    def domain_clear_plan(self, domain):
+        xml = ''
+
+        domain.setMetadata(
+            libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+            xml, METADATA_ELEMENT,
+            METADATA_NS_URI, 0)
+
+    def domain_get_plan(self, domain):
+        try:
+            xml = domain.metadata(
+                libvirt.VIR_DOMAIN_METADATA_ELEMENT,
+                METADATA_NS_URI, 0)
+            dom = _domParseStr(xml)
+            plan = dom.getElementsByTagName('plan')[0].childNodes[0].nodeValue
+        except libvirt.libvirtError:
+            # TODO: handle only 'not found' type exception
+            plan = None
+
+        self.logger.debug(plan)
+        return plan
+
+    def get_domain_by_name(self, name):
+        domain = self.libvirt.lookupByName(name)
+        return domain
+
+    def plan_list(self):
+        plans = self._load_all_plans()
+        self.logger.info('avaliable plans: %s' % plans.keys())
+        return plans.keys()
+
+    def plan_create(self, args):
+        name = args.pop(0)
+        plan = self._get_plan(name)
+
+        self.plans[name] = {}
+        for const in args:
+            key, val = const.split('=')
+            self.plans[name][key] = val
+        self._store_all_plans()
+
+    def plan_update(self, args):
+        name = args.pop(0)
+        try:
+            plan = self._get_plan(name)
+        except NotFoundException:
+            self.plans[name] = {}
+        for const in args:
+            key, val = const.split('=')
+            if val == None:
+                del self.plans[name][key]
+            else:
+                self.plans[name][key] = val
+        self._store_all_plans()
+
+    def plan_delete_key(self, args):
+        name = args.pop(0)
+        plan = self._get_plan(name)
+
+        for key in args:
+            del self.plans[name][key]
+        self._store_all_plans()
+
+
+    def plan_delete(self, name):
+        self._load_all_plans()
+        del self.plans[name]
+        self._store_all_plans()
+
+    def plan_show(self, name):
+        for key, value in self._get_plan(name).iteritems():
+            print "%s=%s" % (key, value)
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(description='Utility to manage constants in MoM '
+                                        '(Memory overcommit Manager) policies')
+
+    subparsers = parser.add_subparsers(help='', dest='command')
+    parser.add_argument('-c', '--conf', metavar='file', help='config file', action='store')
+    parser_vm = subparsers.add_parser('vm', help='virtual machine related actions')
+    parser_plan = subparsers.add_parser('plan', help='plan manipulation')
+
+    group_vm = parser_vm.add_mutually_exclusive_group()
+    group_plan = parser_plan.add_mutually_exclusive_group()
+
+    parser_vm.add_argument('vm-name', type=str, help='Name of virtual machine')
+    group_vm.add_argument('--set', dest='set_plan', metavar='plan', help='Assign, set plan and underlyingconstats to VM', action='store')
+    group_vm.add_argument('--clear', help='Clear plan assignment from VM with underlying constants', action='store_true')
+    group_vm.add_argument('--get', help='Read name of plan of VM', action='store_true')
+
+    group_plan.add_argument('--list', help='List all available plans.', action='store_true')
+    group_plan.add_argument('--create', metavar='plan', nargs='+', help='Create new plan by given name and constants (optionally)', action='store')
+    group_plan.add_argument('--update', metavar='plan', nargs='+', help='Update plan constants.', action='store')
+    group_plan.add_argument('--unset-key', metavar='unset', nargs='+', help='Remove constant(s) from plan.', action='store')
+    group_plan.add_argument('--delete', metavar='plan', help='Delete plan (not from VMs).', action='store')
+    group_plan.add_argument('--show', metavar='plan', help='Show constans defined in givem plan.', action='store')
+
+    params = parser.parse_args()
+    #print params
+    qm = QoSManager()
+    if params.conf:
+        qm.set_config(params.conf)
+
+    if params.command == 'vm':
+        if params.set_plan:
+            dom = qm.get_domain_by_name(params.vm)
+            qm.domain_set_plan(dom, params.set_plan)
+        elif params.clear:
+            dom = qm.get_domain_by_name(params.vm)
+            qm.domain_clear_plan(dom)
+        elif params.get:
+            dom = qm.get_domain_by_name(params.vm)
+            plan = qm.domain_get_plan(dom)
+            if plan is not None:
+                sys.exit(errno.ENOENT)
+            print plan
+    elif params.command == 'plan':
+        if params.create:
+            qm.plan_create(params.create)
+        elif params.list:
+            print '\n'.join(qm.plan_list())
+        elif params.update:
+            qm.plan_update(params.update)
+        elif params.delete:
+            qm.plan_delete(params.delete)
+        elif params.show:
+            qm.plan_show(params.show)
+        elif params.unset_key:
+            qm.plan_delete_key(params.unset_key)
